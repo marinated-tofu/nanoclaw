@@ -7,3 +7,7 @@
 // self-registration import below.
 
 import './cli.js';
+import './whatsapp.js';
+
+// local web chat (browser UI)
+import './local-web.js';
