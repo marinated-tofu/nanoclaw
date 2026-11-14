@@ -117,9 +117,43 @@
   function atBottom() {
     return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < stickyPx;
   }
-  function toBottom(smooth = false) {
-    scroller.scrollTo({ top: scroller.scrollHeight, behavior: smooth ? 'smooth' : 'instant' });
+  // Scrolls the person caused, and following new content while at the bottom,
+  // animate over 240ms on the house curve cubic-bezier(0.4, 0, 0.2, 1).
+  // Instant under reduced motion and when a chat first loads.
+  const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
+  let scrollAnim = 0;
+  function ease(t) {
+    // Solve the cubic bezier (0.4, 0, 0.2, 1) for x = t by bisection.
+    const bx = (u) => 3 * (1 - u) * (1 - u) * u * 0.4 + 3 * (1 - u) * u * u * 0.2 + u * u * u;
+    const by = (u) => 3 * (1 - u) * u * u + u * u * u;
+    let lo = 0,
+      hi = 1;
+    for (let i = 0; i < 20; i++) {
+      const mid = (lo + hi) / 2;
+      if (bx(mid) < t) lo = mid;
+      else hi = mid;
+    }
+    return by((lo + hi) / 2);
+  }
+  function toBottom(animate = false) {
+    cancelAnimationFrame(scrollAnim);
     jump.hidden = true;
+    const from = scroller.scrollTop;
+    if (!animate || reduceMotion.matches) {
+      scroller.scrollTop = scroller.scrollHeight;
+      return;
+    }
+    const start = performance.now();
+    const step = (now) => {
+      const t = Math.min(1, (now - start) / 240);
+      const target = scroller.scrollHeight - scroller.clientHeight;
+      scroller.scrollTop = from + (target - from) * ease(t);
+      if (t < 1) scrollAnim = requestAnimationFrame(step);
+    };
+    scrollAnim = requestAnimationFrame(step);
+  }
+  for (const type of ['wheel', 'touchstart']) {
+    scroller.addEventListener(type, () => cancelAnimationFrame(scrollAnim), { passive: true });
   }
   scroller.addEventListener('scroll', () => {
     top.classList.toggle('scrolled', scroller.scrollTop > 4);
@@ -282,7 +316,7 @@
     item.node = node;
     items.push(item);
     log.append(node);
-    if (stick) toBottom();
+    if (stick) toBottom(true);
     else jump.hidden = false;
   }
 
@@ -359,7 +393,7 @@
     workingText.textContent = label;
     working.hidden = false;
     setDot('busy', 'Working');
-    if (stick) toBottom();
+    if (stick) toBottom(true);
     // Activity events stop partway through long turns; fall back to a neutral label.
     workingTimer = setTimeout(() => (workingText.textContent = 'Working'), 12_000);
   }
