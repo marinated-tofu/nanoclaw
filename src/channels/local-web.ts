@@ -377,7 +377,7 @@ function responseHeaders(contentType: string): Record<string, string> {
     'x-content-type-options': 'nosniff',
     'x-frame-options': 'DENY',
     'content-security-policy':
-      "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+      "default-src 'none'; style-src 'self'; font-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
   };
 }
 
@@ -463,6 +463,8 @@ function createAdapter(): ChannelAdapter {
     },
     '/icon-180.png': { body: readBinary('local-web-icon-180.png'), contentType: 'image/png' },
     '/icon-512.png': { body: readBinary('local-web-icon-512.png'), contentType: 'image/png' },
+    // Montserrat (SIL Open Font License), Latin subset, weights 400-900.
+    '/montserrat.woff2': { body: readBinary('local-web-montserrat.woff2'), contentType: 'font/woff2' },
     '/': { body: readAsset('local-web-broski.html'), contentType: 'text/html; charset=utf-8' },
     '/local-web-broski.css': { body: readAsset('local-web-broski.css'), contentType: 'text/css; charset=utf-8' },
     '/local-web-broski.js': { body: readAsset('local-web-broski.js'), contentType: 'text/javascript; charset=utf-8' },
