@@ -35,6 +35,14 @@ const MAX_MESSAGE_CHARS = 8_000;
 const MAX_QUESTION_ID_CHARS = 256;
 const TOKEN_HEADER = 'x-nanoclaw-local-web-token';
 const TOKEN_FILE = path.join(DATA_DIR, 'local-web', 'token');
+// One JSONL file per conversation, so the chat survives app restarts, host
+// restarts and switching devices. `data/` is never mounted into a container.
+const HISTORY_DIR = path.join(DATA_DIR, 'local-web', 'history');
+const HISTORY_PAGE = 150;
+const HISTORY_MAX_PAGE = 500;
+// A message that arrives this long after Leo's last message was not a reply
+// to him: it came from a scheduled routine.
+const REPLY_WINDOW_MS = 15 * 60_000;
 
 const LOCAL_WEB_DEFAULTS: ChannelDefaults = {
   dm: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'public' },
@@ -48,7 +56,7 @@ type ParsedMessage = { ok: true; conversationId: string; text: string } | ParseF
 type ParsedAction = { ok: true; conversationId: string; questionId: string; option: number } | ParseFailure;
 
 type WebEvent =
-  | { type: 'reply'; text: string; html: string }
+  | { type: 'reply'; text: string; html: string; id?: string; ts?: string; scheduled?: boolean }
   | { type: 'question-resolution'; questionId: string; resolution: string }
   | {
       type: 'question';
@@ -56,7 +64,72 @@ type WebEvent =
       title: string;
       question: string;
       options: Array<{ label: string; selectedLabel: string; style?: string }>;
+      ts?: string;
     };
+
+type HistoryRecord =
+  | { kind: 'user'; id: string; ts: string; text: string }
+  | { kind: 'agent'; id: string; ts: string; text: string; scheduled?: boolean }
+  | {
+      kind: 'question';
+      id: string;
+      ts: string;
+      title: string;
+      question: string;
+      options: Array<{ label: string; selectedLabel: string; style?: string }>;
+    }
+  | { kind: 'resolution'; id: string; ts: string; resolution: string };
+
+function historyFile(platformId: string): string {
+  return path.join(HISTORY_DIR, `${platformId.replace(/[^A-Za-z0-9._-]/g, '_')}.jsonl`);
+}
+
+function appendHistory(platformId: string, record: HistoryRecord): void {
+  try {
+    fs.mkdirSync(HISTORY_DIR, { recursive: true, mode: 0o700 });
+    fs.appendFileSync(historyFile(platformId), `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    // eslint-disable-next-line no-catch-all/no-catch-all -- history is a convenience; a disk error must never block delivery
+  } catch (err) {
+    log.warn('Local web history write failed', { err });
+  }
+}
+
+/** Newest `limit` items before `before` (an item id), oldest first, with question resolutions folded in. */
+function readHistory(platformId: string, before: string | null, limit: number) {
+  let lines: string[] = [];
+  try {
+    lines = fs.readFileSync(historyFile(platformId), 'utf8').split('\n');
+  } catch {
+    return { items: [], hasMore: false };
+  }
+  const items: Array<Record<string, unknown>> = [];
+  const questions = new Map<string, Record<string, unknown>>();
+  for (const line of lines) {
+    if (!line) continue;
+    let record: HistoryRecord;
+    try {
+      record = JSON.parse(line) as HistoryRecord;
+    } catch {
+      continue;
+    }
+    if (record.kind === 'resolution') {
+      const card = questions.get(record.id);
+      if (card) card.resolution = record.resolution;
+      continue;
+    }
+    const item: Record<string, unknown> =
+      record.kind === 'agent' ? { ...record, html: markdown.render(record.text) } : { ...record };
+    if (record.kind === 'question') questions.set(record.id, item);
+    items.push(item);
+  }
+  let end = items.length;
+  if (before) {
+    const index = items.findIndex((item) => item.id === before);
+    if (index >= 0) end = index;
+  }
+  const start = Math.max(0, end - limit);
+  return { items: items.slice(start, end), hasMore: start > 0 };
+}
 
 const markdown = new MarkdownIt({ breaks: true, html: false, linkify: true });
 markdown.validateLink = (url) => /^(?:https?:|mailto:)/i.test(url.trim());
@@ -297,7 +370,11 @@ function createAdapter(): ChannelAdapter {
     },
     '/icon-180.png': { body: readBinary('local-web-icon-180.png'), contentType: 'image/png' },
     '/icon-512.png': { body: readBinary('local-web-icon-512.png'), contentType: 'image/png' },
-    '/': { body: readAsset('local-web-page.html'), contentType: 'text/html; charset=utf-8' },
+    '/': { body: readAsset('local-web-broski.html'), contentType: 'text/html; charset=utf-8' },
+    '/local-web-broski.css': { body: readAsset('local-web-broski.css'), contentType: 'text/css; charset=utf-8' },
+    '/local-web-broski.js': { body: readAsset('local-web-broski.js'), contentType: 'text/javascript; charset=utf-8' },
+    // The original multi-agent page, kept as it was.
+    '/classic': { body: readAsset('local-web-page.html'), contentType: 'text/html; charset=utf-8' },
     '/local-web-page.css': { body: readAsset('local-web-page.css'), contentType: 'text/css; charset=utf-8' },
     '/local-web-chat.css': { body: readAsset('local-web-chat.css'), contentType: 'text/css; charset=utf-8' },
     '/local-web-conversations.css': {
@@ -316,6 +393,7 @@ function createAdapter(): ChannelAdapter {
   const pendingEvents = new Map<string, WebEvent[]>();
   let server: http.Server | null = null;
   const awaitingReplies = new Set<string>();
+  const lastUserMessageAt = new Map<string, number>();
 
   function publish(platformId: string, event: unknown): void {
     const frame = `data: ${JSON.stringify(event)}\n\n`;
@@ -370,6 +448,26 @@ function createAdapter(): ChannelAdapter {
       sendJson(res, 200, await listLocalWebCatalog());
       return;
     }
+    if (req.method === 'GET' && pathname === '/api/history') {
+      if (!requestOriginAllowed(req, authority)) {
+        sendJson(res, 403, { error: 'Cross-origin requests are not allowed.' });
+        return;
+      }
+      const conversationId = url.searchParams.get('conversationId');
+      if (!conversationId || conversationId.length > 128) {
+        sendJson(res, 400, { error: 'A valid conversation ID is required.' });
+        return;
+      }
+      const platformId = await localWebPlatformIdForConversation(conversationId);
+      if (!platformId) {
+        sendJson(res, 404, { error: 'Conversation not found.' });
+        return;
+      }
+      const requested = Number(url.searchParams.get('limit') ?? HISTORY_PAGE);
+      const limit = Number.isInteger(requested) && requested > 0 ? Math.min(requested, HISTORY_MAX_PAGE) : HISTORY_PAGE;
+      sendJson(res, 200, readHistory(platformId, url.searchParams.get('before'), limit));
+      return;
+    }
     if (req.method === 'GET' && pathname === '/events') {
       if (!requestOriginAllowed(req, authority)) {
         sendJson(res, 403, { error: 'Cross-origin requests are not allowed.' });
@@ -418,15 +516,19 @@ function createAdapter(): ChannelAdapter {
         sendJson(res, 404, { error: 'Conversation not found.' });
         return;
       }
+      const id = `local-web-${randomUUID()}`;
+      const ts = new Date().toISOString();
       await setup.onInbound(platformId, null, {
-        id: `local-web-${randomUUID()}`,
+        id,
         kind: 'chat',
-        timestamp: new Date().toISOString(),
+        timestamp: ts,
         content: { text: parsed.text, sender: 'browser', senderId: LOCAL_WEB_USER_ID },
         isGroup: false,
       });
+      appendHistory(platformId, { kind: 'user', id, ts, text: parsed.text });
       awaitingReplies.add(platformId);
-      sendJson(res, 202, { ok: true });
+      lastUserMessageAt.set(platformId, Date.now());
+      sendJson(res, 202, { ok: true, id, ts });
       return;
     }
     if (req.method === 'POST' && pathname === '/api/agents') {
@@ -485,6 +587,12 @@ function createAdapter(): ChannelAdapter {
       }
       const selected = render.options[parsed.option]!;
       setup.onAction(parsed.questionId, selected.value, LOCAL_WEB_USER_ID);
+      appendHistory(platformId, {
+        kind: 'resolution',
+        id: parsed.questionId,
+        ts: new Date().toISOString(),
+        resolution: selected.selectedLabel,
+      });
       publish(platformId, {
         type: 'question-resolution',
         questionId: parsed.questionId,
@@ -547,6 +655,34 @@ function createAdapter(): ChannelAdapter {
       if (!(await isKnownLocalWebPlatformId(platformId))) return undefined;
       const event = await toWebEvent(message);
       if (event === null) return undefined;
+      const ts = new Date().toISOString();
+      if (event.type === 'reply') {
+        const lastUser = lastUserMessageAt.get(platformId);
+        const scheduled =
+          !awaitingReplies.has(platformId) && (lastUser === undefined || Date.now() - lastUser > REPLY_WINDOW_MS);
+        event.id = `reply-${randomUUID()}`;
+        event.ts = ts;
+        if (scheduled) event.scheduled = true;
+        appendHistory(platformId, {
+          kind: 'agent',
+          id: event.id,
+          ts,
+          text: event.text,
+          ...(scheduled && { scheduled: true }),
+        });
+      } else if (event.type === 'question') {
+        event.ts = ts;
+        appendHistory(platformId, {
+          kind: 'question',
+          id: event.questionId,
+          ts,
+          title: event.title,
+          question: event.question,
+          options: event.options,
+        });
+      } else if (event.type === 'question-resolution') {
+        appendHistory(platformId, { kind: 'resolution', id: event.questionId, ts, resolution: event.resolution });
+      }
       const completesTurn = event.type === 'reply' || event.type === 'question';
       if (completesTurn) awaitingReplies.delete(platformId);
       if ((clients.get(platformId)?.size ?? 0) === 0) {
