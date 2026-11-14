@@ -368,6 +368,39 @@ async function parseAction(req: IncomingMessage): Promise<ParsedAction> {
   return { ok: true, conversationId, questionId, option };
 }
 
+const APP_TYPES: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.woff2': 'font/woff2',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml',
+  '.webmanifest': 'application/manifest+json',
+};
+
+/** Every file of a built static app, keyed by its URL path (`index.html` at `/`). Null when there is no build. */
+function readBuiltApp(root: string): Record<string, { body: Buffer; contentType: string }> | null {
+  if (!fs.existsSync(path.join(root, 'index.html'))) return null;
+  const out: Record<string, { body: Buffer; contentType: string }> = {};
+  const walk = (dir: string, depth: number): void => {
+    if (depth > 4) return;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full, depth + 1);
+        continue;
+      }
+      const contentType = APP_TYPES[path.extname(entry.name)];
+      if (!entry.isFile() || !contentType) continue;
+      const rel = path.relative(root, full).split(path.sep).join('/');
+      if (rel.startsWith('api/') || rel === 'events' || rel === 'healthz') continue;
+      out[rel === 'index.html' ? '/' : `/${rel}`] = { body: fs.readFileSync(full), contentType };
+    }
+  };
+  walk(root, 0);
+  return out;
+}
+
 function responseHeaders(contentType: string): Record<string, string> {
   return {
     'cache-control': 'no-store',
@@ -482,6 +515,14 @@ function createAdapter(): ChannelAdapter {
     },
     '/local-web-page.js': { body: readAsset('local-web-page.js'), contentType: 'text/javascript; charset=utf-8' },
   };
+  // The built broski app (data/local-web/app, git-ignored), when present, takes
+  // over `/`; the hand-written page stays at `/v1`. Read once at startup into
+  // the same exact-match table, so requests still never touch the filesystem.
+  const app = readBuiltApp(path.join(DATA_DIR, 'local-web', 'app'));
+  if (app) {
+    assets['/v1'] = assets['/'];
+    for (const [route, entry] of Object.entries(app)) if (!assets[route] || route === '/') assets[route] = entry;
+  }
   const clients = new Map<string, Set<ServerResponse>>();
   // Server-side buffer while no browser is connected; unrelated to the page's own 100-item view cap.
   const MAX_PENDING_EVENTS = 100;
