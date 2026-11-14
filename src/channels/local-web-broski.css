@@ -70,7 +70,12 @@
   display: none !important;
 }
 .md a.short-link {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
   overflow-wrap: normal;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
   white-space: nowrap;
 }
 html,
