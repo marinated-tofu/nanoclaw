@@ -76,11 +76,13 @@
   let workingTimer = null;
 
   // ---- time ----
-  const timeFmt = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' });
-  const dayFmt = new Intl.DateTimeFormat(undefined, { weekday: 'long', month: 'short', day: 'numeric' });
+  // Qatar time throughout, matching how broski writes times in its messages.
+  const timeZone = 'Asia/Qatar';
+  const timeFmt = new Intl.DateTimeFormat(undefined, { timeZone, hour: 'numeric', minute: '2-digit' });
+  const dayFmt = new Intl.DateTimeFormat(undefined, { timeZone, weekday: 'long', month: 'short', day: 'numeric' });
+  const keyFmt = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' });
   function dayKey(ts) {
-    const d = new Date(ts);
-    return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+    return keyFmt.format(new Date(ts));
   }
   function dayLabel(ts) {
     const d = new Date(ts);
@@ -115,7 +117,7 @@
   function timeNode(ts) {
     const t = el('time', '', timeFmt.format(new Date(ts)));
     t.dateTime = ts;
-    t.title = new Date(ts).toLocaleString();
+    t.title = new Date(ts).toLocaleString(undefined, { timeZone });
     return t;
   }
   function copyButton(text) {
@@ -145,6 +147,17 @@
     for (const a of node.querySelectorAll('a')) {
       a.target = '_blank';
       a.rel = 'noopener noreferrer';
+      // A bare pasted URL reads as a wall of characters; show host and first path segment.
+      if (a.textContent === a.getAttribute('href') || a.textContent === a.href) {
+        try {
+          const url = new URL(a.href);
+          const first = url.pathname.split('/').filter(Boolean)[0];
+          const rest = url.pathname.split('/').filter(Boolean).length > 1 || url.search;
+          a.textContent = `${url.hostname.replace(/^www\./, '')}${first ? `/${first}` : ''}${rest ? '/…' : ''}`;
+          a.title = a.href;
+          a.classList.add('short-link');
+        } catch {}
+      }
     }
   }
 
@@ -280,7 +293,7 @@
     const mark = el('img', 'hello-mark');
     mark.src = '/icon-180.png';
     mark.alt = '';
-    const hour = new Date().getHours();
+    const hour = Number(new Intl.DateTimeFormat('en-GB', { timeZone, hour: 'numeric', hourCycle: 'h23' }).format(new Date()));
     const greet = hour < 12 ? 'Good morning, Leo' : hour < 18 ? 'Good afternoon, Leo' : 'Good evening, Leo';
     hello.append(mark, el('h2', '', greet), el('p', '', 'Ask me anything, or pick one to start.'));
     const chips = el('div', 'chips');

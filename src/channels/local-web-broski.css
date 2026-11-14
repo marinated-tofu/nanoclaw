@@ -66,6 +66,13 @@
 * {
   box-sizing: border-box;
 }
+[hidden] {
+  display: none !important;
+}
+.md a.short-link {
+  overflow-wrap: normal;
+  white-space: nowrap;
+}
 html,
 body {
   margin: 0;
