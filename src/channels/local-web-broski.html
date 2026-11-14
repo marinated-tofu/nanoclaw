@@ -19,8 +19,13 @@
       <div class="top-inner">
         <span class="top-spacer" aria-hidden="true"></span>
         <h1 class="title">
-          broski
-          <span id="status-dot" class="status-dot" data-state="down" role="status" aria-label="Connecting"></span>
+          <button id="switch" class="switch" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="chats">
+            <span id="chat-name">broski</span>
+            <span id="status-dot" class="status-dot" data-state="down" role="status" aria-label="Connecting"></span>
+            <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="m7 10 5 5 5-5" />
+            </svg>
+          </button>
         </h1>
         <button id="theme" class="icon-btn" type="button" aria-label="Switch theme">
           <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -32,7 +37,9 @@
           </svg>
         </button>
       </div>
+      <nav id="chats" class="chats" aria-label="Chats" hidden></nav>
     </header>
+    <div id="scrim" class="scrim" hidden></div>
 
     <main id="scroller" class="scroller">
       <div class="column">
@@ -50,6 +57,18 @@
       </svg>
     </button>
 
+    <section id="routines" class="routines" aria-label="Routines" hidden>
+      <div class="routines-head">
+        <h2>Routines</h2>
+        <button id="routines-close" class="icon-btn" type="button" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M6 6l12 12M18 6 6 18" />
+          </svg>
+        </button>
+      </div>
+      <div id="routines-list" class="routines-list"></div>
+    </section>
+
     <footer class="dock">
       <div class="column">
         <form id="composer" class="composer">
@@ -61,6 +80,7 @@
             </svg>
           </button>
         </form>
+        <p id="archive-note" class="archive-note" hidden>Imported from Grok. This chat is read-only.</p>
       </div>
     </footer>
 

@@ -3,12 +3,15 @@ import fs from 'node:fs';
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import path from 'node:path';
 
+import { CronExpressionParser } from 'cron-parser';
 import MarkdownIt from 'markdown-it';
 
 import { DATA_DIR, INSTALL_SLUG } from '../config.js';
+import { resolveGroupTimezone } from '../container-config.js';
 import { readEnvFile } from '../env.js';
 import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
-import { findSessionForAgent } from '../db/sessions.js';
+import { findSessionForAgent, findTaskSessions } from '../db/sessions.js';
+import { parseTaskContent } from '../modules/scheduling/task-content.js';
 import { log } from '../log.js';
 import { withExistingMailboxSession } from '../session-manager.js';
 import type { ChannelAdapter, ChannelDefaults, ChannelSetup, OutboundMessage } from './adapter.js';
@@ -94,11 +97,40 @@ function appendHistory(platformId: string, record: HistoryRecord): void {
   }
 }
 
+// Read-only chats imported from elsewhere (for example the old Grok group
+// chats). `index.json` lists them as [{ id, title, subtitle? }], and each one's
+// messages are in `<id>.jsonl` in the same record format as live history.
+const ARCHIVE_DIR = path.join(DATA_DIR, 'local-web', 'archives');
+const ARCHIVE_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+type ArchiveEntry = { id: string; title: string; subtitle?: string };
+
+function listArchives(): ArchiveEntry[] {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(ARCHIVE_DIR, 'index.json'), 'utf8')) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (entry): entry is ArchiveEntry =>
+        typeof entry === 'object' &&
+        entry !== null &&
+        typeof (entry as ArchiveEntry).id === 'string' &&
+        ARCHIVE_ID.test((entry as ArchiveEntry).id) &&
+        typeof (entry as ArchiveEntry).title === 'string',
+    );
+  } catch {
+    return [];
+  }
+}
+
 /** Newest `limit` items before `before` (an item id), oldest first, with question resolutions folded in. */
 function readHistory(platformId: string, before: string | null, limit: number) {
+  return readHistoryFile(historyFile(platformId), before, limit);
+}
+
+function readHistoryFile(file: string, before: string | null, limit: number) {
   let lines: string[] = [];
   try {
-    lines = fs.readFileSync(historyFile(platformId), 'utf8').split('\n');
+    lines = fs.readFileSync(file, 'utf8').split('\n');
   } catch {
     return { items: [], hasMore: false };
   }
@@ -129,6 +161,67 @@ function readHistory(platformId: string, before: string | null, limit: number) {
   }
   const start = Math.max(0, end - limit);
   return { items: items.slice(start, end), hasMore: start > 0 };
+}
+
+// ---- routines (the agent's recurring scheduled tasks) ----
+
+type Routine = {
+  seriesId: string;
+  sessionId: string;
+  name: string;
+  enabled: boolean;
+  recurrence: string;
+  nextRun: string | null;
+};
+
+function routineName(prompt: string, fallback: string): string {
+  const match = /^Scheduled routine: (.+?)\.\s/.exec(prompt);
+  return match ? match[1] : fallback;
+}
+
+async function listRoutines(agentGroupId: string): Promise<Routine[]> {
+  const routines: Routine[] = [];
+  for (const session of await findTaskSessions(agentGroupId)) {
+    const rows = await withExistingMailboxSession(agentGroupId, session.id, (mailbox) => mailbox.listLiveTasks());
+    for (const row of rows ?? []) {
+      if (!row.recurrence) continue;
+      const seriesId = row.seriesId ?? row.id;
+      routines.push({
+        seriesId,
+        sessionId: session.id,
+        name: routineName(parseTaskContent(row.content).prompt, seriesId),
+        enabled: row.status === 'pending',
+        recurrence: row.recurrence,
+        nextRun: row.processAfter,
+      });
+    }
+  }
+  return routines;
+}
+
+/**
+ * Switch a routine on or off. Turning one back on moves a run time that passed
+ * while it was off to the next slot on its schedule, so it does not fire at once.
+ */
+async function setRoutineEnabled(agentGroupId: string, seriesId: string, enabled: boolean): Promise<boolean> {
+  const routine = (await listRoutines(agentGroupId)).find((r) => r.seriesId === seriesId);
+  if (!routine) return false;
+  if (routine.enabled === enabled) return true;
+  const tz = await resolveGroupTimezone(agentGroupId);
+  const changed = await withExistingMailboxSession(agentGroupId, routine.sessionId, (mailbox) => {
+    if (!enabled) return mailbox.pauseTask(seriesId);
+    if (!routine.nextRun || Date.parse(routine.nextRun) < Date.now()) {
+      const next = CronExpressionParser.parse(routine.recurrence, { tz }).next().toDate().toISOString();
+      mailbox.updateTask(seriesId, { processAfter: next });
+    }
+    return mailbox.resumeTask(seriesId);
+  });
+  return (changed ?? 0) > 0;
+}
+
+function agentGroupOf(platformId: string): string | null {
+  const match = /^local-web:agent:(.+)$/.exec(platformId);
+  return match ? match[1] : null;
 }
 
 const markdown = new MarkdownIt({ breaks: true, html: false, linkify: true });
@@ -446,6 +539,68 @@ function createAdapter(): ChannelAdapter {
         return;
       }
       sendJson(res, 200, await listLocalWebCatalog());
+      return;
+    }
+    if (pathname === '/api/routines' && (req.method === 'GET' || req.method === 'POST')) {
+      if (!requestOriginAllowed(req, authority)) {
+        sendJson(res, 403, { error: 'Cross-origin requests are not allowed.' });
+        return;
+      }
+      let conversationId = url.searchParams.get('conversationId');
+      let change: { seriesId: string; enabled: boolean } | null = null;
+      if (req.method === 'POST') {
+        const parsed = await parseObject(req);
+        if (!parsed.ok) {
+          sendJson(res, parsed.status, { error: parsed.message });
+          return;
+        }
+        const { seriesId, enabled } = parsed.value;
+        conversationId = typeof parsed.value.conversationId === 'string' ? parsed.value.conversationId : null;
+        if (typeof seriesId !== 'string' || seriesId.length > 128 || typeof enabled !== 'boolean') {
+          sendJson(res, 400, { error: 'A routine and an on/off value are required.' });
+          return;
+        }
+        change = { seriesId, enabled };
+      }
+      if (!conversationId || conversationId.length > 128) {
+        sendJson(res, 400, { error: 'A valid conversation ID is required.' });
+        return;
+      }
+      const platformId = await localWebPlatformIdForConversation(conversationId);
+      const agentGroupId = platformId ? agentGroupOf(platformId) : null;
+      if (!agentGroupId) {
+        sendJson(res, 404, { error: 'Conversation not found.' });
+        return;
+      }
+      if (change && !(await setRoutineEnabled(agentGroupId, change.seriesId, change.enabled))) {
+        sendJson(res, 404, { error: 'Routine not found.' });
+        return;
+      }
+      const routines = (await listRoutines(agentGroupId)).map(({ sessionId: _session, ...rest }) => rest);
+      sendJson(res, 200, { timezone: await resolveGroupTimezone(agentGroupId), routines });
+      return;
+    }
+    if (req.method === 'GET' && pathname === '/api/archives') {
+      if (!requestOriginAllowed(req, authority)) {
+        sendJson(res, 403, { error: 'Cross-origin requests are not allowed.' });
+        return;
+      }
+      sendJson(res, 200, { archives: listArchives() });
+      return;
+    }
+    if (req.method === 'GET' && pathname === '/api/archive-history') {
+      if (!requestOriginAllowed(req, authority)) {
+        sendJson(res, 403, { error: 'Cross-origin requests are not allowed.' });
+        return;
+      }
+      const id = url.searchParams.get('archive') ?? '';
+      if (!ARCHIVE_ID.test(id) || !listArchives().some((entry) => entry.id === id)) {
+        sendJson(res, 404, { error: 'Chat not found.' });
+        return;
+      }
+      const requested = Number(url.searchParams.get('limit') ?? HISTORY_PAGE);
+      const limit = Number.isInteger(requested) && requested > 0 ? Math.min(requested, HISTORY_MAX_PAGE) : HISTORY_PAGE;
+      sendJson(res, 200, readHistoryFile(path.join(ARCHIVE_DIR, `${id}.jsonl`), url.searchParams.get('before'), limit));
       return;
     }
     if (req.method === 'GET' && pathname === '/api/history') {

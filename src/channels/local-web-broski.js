@@ -25,12 +25,22 @@
   const dot = document.querySelector('#status-dot');
   const top = document.querySelector('.top');
   const themeButton = document.querySelector('#theme');
+  const switcher = document.querySelector('#switch');
+  const chatName = document.querySelector('#chat-name');
+  const menu = document.querySelector('#chats');
+  const scrim = document.querySelector('#scrim');
+  const archiveNote = document.querySelector('#archive-note');
+  const routinesView = document.querySelector('#routines');
+  const routinesList = document.querySelector('#routines-list');
+  const routinesClose = document.querySelector('#routines-close');
   const touch = matchMedia('(pointer: coarse)').matches;
 
   const icons = {
     copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M5 15V6.5A2.5 2.5 0 0 1 7.5 4H15"/></svg>',
-    check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>',
-    clock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>',
+    check:
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>',
+    clock:
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>',
   };
 
   // ---- theme ----
@@ -64,12 +74,22 @@
   async function getJson(url) {
     const response = await fetch(url, { headers: headers() });
     const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw Object.assign(new Error(body.error || `Request failed (${response.status})`), { status: response.status });
+    if (!response.ok)
+      throw Object.assign(new Error(body.error || `Request failed (${response.status})`), { status: response.status });
     return body;
   }
 
   // ---- state ----
   let conversationId = null;
+  let archive = null; // { id, title } while reading an imported chat
+  let archives = [];
+  let loadToken = 0;
+  function historyUrl(extra = '') {
+    const base = archive
+      ? `/api/archive-history?archive=${encodeURIComponent(archive.id)}`
+      : `/api/history?conversationId=${encodeURIComponent(conversationId)}`;
+    return base + extra;
+  }
   const items = []; // rendered items, oldest first
   const seen = new Set();
   let hasMore = false;
@@ -245,7 +265,7 @@
       log.append(node);
     }
     older.hidden = !hasMore;
-    if (items.length === 0) showHello();
+    if (items.length === 0 && !archive) showHello();
   }
 
   function append(item, animate = true) {
@@ -293,7 +313,9 @@
     const mark = el('img', 'hello-mark');
     mark.src = '/icon-180.png';
     mark.alt = '';
-    const hour = Number(new Intl.DateTimeFormat('en-GB', { timeZone, hour: 'numeric', hourCycle: 'h23' }).format(new Date()));
+    const hour = Number(
+      new Intl.DateTimeFormat('en-GB', { timeZone, hour: 'numeric', hourCycle: 'h23' }).format(new Date()),
+    );
     const greet = hour < 12 ? 'Good morning, Leo' : hour < 18 ? 'Good afternoon, Leo' : 'Good evening, Leo';
     hello.append(mark, el('h2', '', greet), el('p', '', 'Ask me anything, or pick one to start.'));
     const chips = el('div', 'chips');
@@ -424,7 +446,9 @@
     return { ...record };
   }
   async function loadLatest() {
-    const page = await getJson(`/api/history?conversationId=${encodeURIComponent(conversationId)}`);
+    const ticket = ++loadToken;
+    const page = await getJson(historyUrl());
+    if (ticket !== loadToken) return;
     items.length = 0;
     seen.clear();
     for (const record of page.items) {
@@ -439,10 +463,10 @@
   // Pick up anything that arrived while the app was closed or the stream was down.
   let catching = false;
   async function catchUp() {
-    if (catching || !conversationId) return;
+    if (catching || !conversationId || archive) return;
     catching = true;
     try {
-      const page = await getJson(`/api/history?conversationId=${encodeURIComponent(conversationId)}&limit=60`);
+      const page = await getJson(historyUrl('&limit=60'));
       for (const record of page.items) {
         if (record.kind === 'question' && record.resolution) resolveQuestion(record.id, record.resolution);
         if (record.id && seen.has(record.id)) continue;
@@ -458,9 +482,9 @@
     if (!first) return;
     older.disabled = true;
     try {
-      const page = await getJson(
-        `/api/history?conversationId=${encodeURIComponent(conversationId)}&before=${encodeURIComponent(first.id)}`,
-      );
+      const ticket = loadToken;
+      const page = await getJson(historyUrl(`&before=${encodeURIComponent(first.id)}`));
+      if (ticket !== loadToken) return;
       const before = scroller.scrollHeight;
       const fresh = page.items.filter((record) => !(record.id && seen.has(record.id))).map(fromHistory);
       fresh.forEach((item) => item.id && seen.add(item.id));
@@ -526,6 +550,183 @@
     }
   }
 
+  // ---- chat menu: the live chat, imported read-only chats, and routines ----
+  function closeMenu() {
+    menu.hidden = true;
+    if (routinesView.hidden) scrim.hidden = true;
+    switcher.setAttribute('aria-expanded', 'false');
+  }
+  function menuRow(label, sub, active, onClick) {
+    const row = el('button', `chat-row${active ? ' active' : ''}`);
+    row.type = 'button';
+    row.append(el('span', 'chat-row-title', label));
+    if (sub) row.append(el('span', 'chat-row-sub', sub));
+    row.addEventListener('click', onClick);
+    return row;
+  }
+  function openMenu() {
+    menu.replaceChildren();
+    menu.append(el('p', 'menu-label', 'Chats'));
+    menu.append(menuRow('broski', 'Your chat with broski', !archive, () => openChat(null)));
+    for (const entry of archives) {
+      menu.append(
+        menuRow(entry.title, entry.subtitle || 'Imported, read-only', archive?.id === entry.id, () => openChat(entry)),
+      );
+    }
+    menu.append(el('p', 'menu-label', 'Settings'));
+    menu.append(menuRow('Routines', 'What broski runs on a schedule', false, () => openRoutines()));
+    menu.hidden = false;
+    scrim.hidden = false;
+    switcher.setAttribute('aria-expanded', 'true');
+  }
+  switcher.addEventListener('click', () => (menu.hidden ? openMenu() : closeMenu()));
+  scrim.addEventListener('click', () => {
+    closeMenu();
+    closeRoutines();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    closeMenu();
+    closeRoutines();
+  });
+
+  async function openChat(entry) {
+    closeMenu();
+    if ((entry?.id ?? null) === (archive?.id ?? null)) return;
+    archive = entry ? { id: entry.id, title: entry.title } : null;
+    chatName.textContent = archive ? archive.title : 'broski';
+    document.title = archive ? `${archive.title} · broski` : 'broski';
+    form.hidden = Boolean(archive);
+    archiveNote.hidden = !archive;
+    dot.hidden = Boolean(archive);
+    jump.hidden = true;
+    setWorking(null);
+    document.querySelector('.hello')?.remove();
+    if (archive) streamAbort?.abort();
+    try {
+      await loadLatest();
+    } catch (error) {
+      notice(error.message || 'Could not load that chat.');
+    }
+    if (!archive) restartStream();
+  }
+
+  // ---- routines ----
+  const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  function clock(hour, minute) {
+    const h = hour % 12 === 0 ? 12 : hour % 12;
+    return `${h}:${String(minute).padStart(2, '0')} ${hour < 12 ? 'AM' : 'PM'}`;
+  }
+  function expand(field, max) {
+    if (field === '*') return null;
+    const out = [];
+    for (const part of field.split(',')) {
+      const [range, stepText] = part.split('/');
+      const step = Number(stepText || 1);
+      const [a, b] = range === '*' ? [0, max] : range.split('-').map(Number);
+      for (let v = a; v <= (b ?? a); v += step) out.push(v);
+    }
+    return out;
+  }
+  function joinWords(words) {
+    return words.length < 3 ? words.join(' and ') : `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}`;
+  }
+  // Plain-English schedule for the cron shapes routines use; falls back to the raw expression.
+  function describeCron(expr) {
+    const parts = expr.trim().split(/\s+/);
+    if (parts.length !== 5 || parts[2] !== '*' || parts[3] !== '*') return expr;
+    const minutes = expand(parts[0], 59);
+    const hours = expand(parts[1], 23);
+    const days = expand(parts[4], 6)?.map((d) => d % 7);
+    if (!minutes || minutes.length !== 1 || !hours) return expr;
+    const m = minutes[0];
+    let dayText = 'Every day';
+    if (days) {
+      const set = [...new Set(days)].sort();
+      if (set.join() === '1,2,3,4,5') dayText = 'Weekdays';
+      else if (set.join() === '0,6') dayText = 'Weekends';
+      else if (set.length < 7) dayText = `Every ${joinWords(set.map((d) => dayNames[d]))}`;
+    }
+    if (hours.length === 1) return `${dayText} at ${clock(hours[0], m)}`;
+    const gaps = hours.slice(1).map((h, i) => h - hours[i]);
+    if (!gaps.every((g) => g === gaps[0])) return `${dayText} at ${joinWords(hours.map((h) => clock(h, m)))}`;
+    const every = gaps[0] === 1 ? 'every hour' : `every ${gaps[0]} hours`;
+    const span = `${clock(hours[0], m)} – ${clock(hours[hours.length - 1], m)}`;
+    return dayText === 'Every day' ? `Every ${every.slice(6)}, ${span}` : `${dayText}, ${every}, ${span}`;
+  }
+
+  function routineRow(routine) {
+    const row = el('div', 'routine');
+    const iconWrap = el('span', 'routine-icon');
+    iconWrap.innerHTML = icons.clock;
+    const text = el('div', 'routine-text');
+    text.append(el('span', 'routine-name', routine.name));
+    const sub = el('span', 'routine-sub', routine.enabled ? describeCron(routine.recurrence) : 'Paused');
+    if (routine.enabled && routine.nextRun) {
+      sub.title = `Next run: ${new Date(routine.nextRun).toLocaleString(undefined, { timeZone })}`;
+    }
+    text.append(sub);
+    const toggle = el('button', 'toggle');
+    toggle.type = 'button';
+    toggle.setAttribute('role', 'switch');
+    toggle.setAttribute('aria-checked', String(routine.enabled));
+    toggle.setAttribute('aria-label', routine.name);
+    toggle.addEventListener('click', async () => {
+      toggle.disabled = true;
+      const want = !routine.enabled;
+      toggle.setAttribute('aria-checked', String(want));
+      try {
+        const response = await fetch('/api/routines', {
+          method: 'POST',
+          headers: headers({ 'content-type': 'application/json' }),
+          body: JSON.stringify({ conversationId, seriesId: routine.seriesId, enabled: want }),
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.error || `Could not change it (${response.status})`);
+        renderRoutines(body.routines);
+      } catch (error) {
+        toggle.setAttribute('aria-checked', String(routine.enabled));
+        toggle.disabled = false;
+        routinesList.querySelector('.routines-error')?.remove();
+        routinesList.prepend(el('p', 'routines-error', error.message || 'Could not change it.'));
+      }
+    });
+    row.append(iconWrap, text, toggle);
+    return row;
+  }
+  function renderRoutines(list) {
+    const sorted = [...(list || [])].sort((a, b) => {
+      if (a.enabled !== b.enabled) return a.enabled ? -1 : 1;
+      return (a.nextRun || '').localeCompare(b.nextRun || '');
+    });
+    routinesList.replaceChildren();
+    if (sorted.length === 0) {
+      routinesList.append(el('p', 'routines-empty', 'No routines yet.'));
+      return;
+    }
+    routinesList.append(el('p', 'menu-label', 'Upcoming'));
+    const group = el('div', 'routine-group');
+    for (const routine of sorted) group.append(routineRow(routine));
+    routinesList.append(group);
+  }
+  async function openRoutines() {
+    closeMenu();
+    routinesView.hidden = false;
+    scrim.hidden = false;
+    routinesList.replaceChildren(el('p', 'routines-empty', 'Loading…'));
+    try {
+      const body = await getJson(`/api/routines?conversationId=${encodeURIComponent(conversationId)}`);
+      renderRoutines(body.routines);
+    } catch (error) {
+      routinesList.replaceChildren(el('p', 'routines-error', error.message || 'Could not load routines.'));
+    }
+  }
+  function closeRoutines() {
+    routinesView.hidden = true;
+    if (menu.hidden) scrim.hidden = true;
+  }
+  routinesClose.addEventListener('click', closeRoutines);
+
   // ---- lifecycle ----
   function showLocked() {
     setDot('down', 'Not connected');
@@ -548,10 +749,10 @@
       hiddenAt = Date.now();
       return;
     }
-    if (conversationId && Date.now() - hiddenAt > 3000) restartStream();
+    if (conversationId && !archive && Date.now() - hiddenAt > 3000) restartStream();
   });
   window.addEventListener('pageshow', (event) => {
-    if (event.persisted && conversationId) restartStream();
+    if (event.persisted && conversationId && !archive) restartStream();
   });
 
   async function boot() {
@@ -565,6 +766,9 @@
       await loadLatest();
       restartStream();
       if (!touch) input.focus();
+      archives = await getJson('/api/archives')
+        .then((body) => (Array.isArray(body.archives) ? body.archives : []))
+        .catch(() => []);
     } catch (error) {
       if (error.status === 401) return showLocked();
       setDot('down', 'Not connected');
