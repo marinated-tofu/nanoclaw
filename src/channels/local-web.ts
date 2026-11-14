@@ -28,6 +28,7 @@ import {
   localWebQuestionBelongsToConversation,
   parseCreateLocalWebAgentRequest,
 } from './local-web-conversations.js';
+import { accessConfigFromEnv, createAccessVerifier } from './local-web-access.js';
 import { resolveQuestionRender } from './question-render-registry.js';
 
 const CHANNEL_TYPE = LOCAL_WEB_CHANNEL_TYPE;
@@ -484,6 +485,9 @@ async function currentTool(platformId: string): Promise<string | null> {
 function createAdapter(): ChannelAdapter {
   const port = configuredPort();
   const token = readOrCreateToken();
+  // Cloudflare Access sign-in, when configured: see local-web-access.ts.
+  const accessConfig = accessConfigFromEnv();
+  const accessVerifier = accessConfig ? createAccessVerifier(accessConfig) : null;
   // Exact-match table, so no request path ever reaches the filesystem. Splitting
   // the stylesheet and script out of the document is what lets the CSP name
   // 'self' instead of 'unsafe-inline'.
@@ -569,7 +573,7 @@ function createAdapter(): ChannelAdapter {
     // and the shell has to load before it can present its token or explain that
     // it has none. The Origin/Host checks above and below are defense-in-depth
     // only: an HTTP client sets those headers freely.
-    if (!isAuthorized(req, token)) {
+    if (!isAuthorized(req, token) && !(accessVerifier && (await accessVerifier(req)))) {
       sendJson(res, 401, {
         error: 'This browser is not authorized. Run `pnpm local-web` in the NanoClaw folder and open its link.',
       });
