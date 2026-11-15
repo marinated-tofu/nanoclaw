@@ -23,9 +23,16 @@ exec 9>"${TMPDIR:-/tmp}/nanoclaw-redeploy-$SERVICE.lock"
 flock -n 9 || exit 0
 
 git fetch -q origin "$BRANCH" || { log "fetch failed"; exit 1; }
-old=$(git rev-parse HEAD)
 new=$(git rev-parse "origin/$BRANCH")
+# Compare with what is running, not with HEAD: a commit made in this checkout
+# and pushed leaves HEAD equal to origin while the service still runs older code.
+STATE=data/upgrade-state.json
+old=$(sed -n 's/.*"commit": *"\([0-9a-f]\{40\}\)".*/\1/p' "$STATE" 2>/dev/null | head -1)
+git cat-file -e "${old:-x}^{commit}" 2>/dev/null || old=$(git rev-parse HEAD)
+FAILED=data/redeploy.failed
 [ "$old" = "$new" ] && [ "${FORCE:-0}" != 1 ] && exit 0
+# A commit that failed once is not retried every two minutes; push a fix.
+[ "$(cat "$FAILED" 2>/dev/null)" = "$new" ] && [ "${FORCE:-0}" != 1 ] && exit 0
 
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   log "skipped $new: the checkout has uncommitted changes"
@@ -59,11 +66,13 @@ healthy() {
 git merge -q --ff-only "origin/$BRANCH"
 log "deploying $(git log --oneline -1 HEAD)"
 if build "$old" && healthy; then
+  rm -f "$FAILED"
   log "deployed $new"
   exit 0
 fi
 
 log "deploy of $new failed; going back to $old"
+echo "$new" >"$FAILED"
 git reset -q --hard "$old"
 if build "$new" && healthy; then
   log "rolled back to $old"
