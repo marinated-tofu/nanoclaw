@@ -498,6 +498,7 @@ function createAdapter(): ChannelAdapter {
       body: readAsset('local-web-manifest.webmanifest'),
       contentType: 'application/manifest+json',
     },
+    '/favicon.svg': { body: readAsset('local-web-favicon.svg'), contentType: 'image/svg+xml' },
     '/icon-180.png': { body: readBinary('local-web-icon-180.png'), contentType: 'image/png' },
     '/icon-512.png': { body: readBinary('local-web-icon-512.png'), contentType: 'image/png' },
     // Montserrat (SIL Open Font License), Latin subset, weights 400-900.
