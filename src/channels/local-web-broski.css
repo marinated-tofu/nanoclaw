@@ -100,6 +100,7 @@ body {
   display: flex;
   flex-direction: column;
   height: 100dvh;
+  height: var(--app-height, 100dvh);
   background: var(--color-surface);
   color: rgb(var(--color-ink));
   font-family: Montserrat, 'Montserrat Fallback', Arial, sans-serif;
