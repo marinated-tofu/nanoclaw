@@ -623,6 +623,10 @@ function createAdapter(): ChannelAdapter {
       contentType: 'application/manifest+json',
     },
     '/favicon.svg': { body: readAsset('local-web-favicon.svg'), contentType: 'image/svg+xml' },
+    // Safari on iOS ignores SVG icons, and browsers ask for /favicon.ico on their own.
+    '/favicon-32.png': { body: readBinary('local-web-favicon-32.png'), contentType: 'image/png' },
+    '/favicon-64.png': { body: readBinary('local-web-favicon-64.png'), contentType: 'image/png' },
+    '/favicon.ico': { body: readBinary('local-web-favicon-64.png'), contentType: 'image/png' },
     '/icon-180.png': { body: readBinary('local-web-icon-180.png'), contentType: 'image/png' },
     '/icon-512.png': { body: readBinary('local-web-icon-512.png'), contentType: 'image/png' },
     // Montserrat (SIL Open Font License), Latin subset, weights 400-900.
