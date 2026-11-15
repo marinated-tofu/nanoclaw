@@ -11,6 +11,12 @@ import { resolveGroupTimezone } from '../container-config.js';
 import { readEnvFile } from '../env.js';
 import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { findSessionForAgent, findTaskSessions } from '../db/sessions.js';
+import {
+  createScheduledTask,
+  enforceRecurrenceLimit,
+  prepareScheduledTask,
+  validateRecurrence,
+} from '../modules/scheduling/create.js';
 import { parseTaskContent } from '../modules/scheduling/task-content.js';
 import { log } from '../log.js';
 import { withExistingMailboxSession } from '../session-manager.js';
@@ -29,12 +35,31 @@ import {
   parseCreateLocalWebAgentRequest,
 } from './local-web-conversations.js';
 import { accessConfigFromEnv, createAccessVerifier } from './local-web-access.js';
+import {
+  fileResponseHeaders,
+  MAX_UPLOAD_BYTES,
+  parseUploads,
+  readStoredFile,
+  saveFile,
+  type StoredFile,
+  type UploadedFile,
+} from './local-web-files.js';
+import {
+  checkRoutineName,
+  composeRoutinePrompt,
+  DEFAULT_ROUTINE_PREAMBLE,
+  MAX_ROUTINE_BODY_CHARS,
+  splitRoutinePrompt,
+} from './local-web-routine-prompt.js';
 import { resolveQuestionRender } from './question-render-registry.js';
 
 const CHANNEL_TYPE = LOCAL_WEB_CHANNEL_TYPE;
 const LISTEN_HOST = '127.0.0.1';
 const DEFAULT_PORT = 3210;
 const MAX_BODY_BYTES = 32 * 1024;
+// A message with files carries them base64-encoded in the JSON body.
+const MAX_MESSAGE_BODY_BYTES = Math.ceil((MAX_UPLOAD_BYTES * 4) / 3) + 64 * 1024;
+const FILE_ROUTE = /^\/api\/files\/([0-9a-f-]{36})$/;
 const MAX_MESSAGE_CHARS = 8_000;
 const MAX_QUESTION_ID_CHARS = 256;
 const TOKEN_HEADER = 'x-nanoclaw-local-web-token';
@@ -56,11 +81,19 @@ const LOCAL_WEB_DEFAULTS: ChannelDefaults = {
 
 type ParseFailure = { ok: false; status: number; message: string };
 type ParsedObject = { ok: true; value: Record<string, unknown> } | ParseFailure;
-type ParsedMessage = { ok: true; conversationId: string; text: string } | ParseFailure;
+type ParsedMessage = { ok: true; conversationId: string; text: string; files: UploadedFile[] } | ParseFailure;
 type ParsedAction = { ok: true; conversationId: string; questionId: string; option: number } | ParseFailure;
 
 type WebEvent =
-  | { type: 'reply'; text: string; html: string; id?: string; ts?: string; scheduled?: boolean }
+  | {
+      type: 'reply';
+      text: string;
+      html: string;
+      id?: string;
+      ts?: string;
+      scheduled?: boolean;
+      files?: StoredFile[];
+    }
   | { type: 'question-resolution'; questionId: string; resolution: string }
   | {
       type: 'question';
@@ -72,8 +105,8 @@ type WebEvent =
     };
 
 type HistoryRecord =
-  | { kind: 'user'; id: string; ts: string; text: string }
-  | { kind: 'agent'; id: string; ts: string; text: string; scheduled?: boolean }
+  | { kind: 'user'; id: string; ts: string; text: string; files?: StoredFile[] }
+  | { kind: 'agent'; id: string; ts: string; text: string; scheduled?: boolean; files?: StoredFile[] }
   | {
       kind: 'question';
       id: string;
@@ -173,6 +206,10 @@ type Routine = {
   enabled: boolean;
   recurrence: string;
   nextRun: string | null;
+  /** The editable part of the prompt; the delivery preamble stays as stored. */
+  prompt: string;
+  preamble: string;
+  hasScript: boolean;
 };
 
 function routineName(prompt: string, fallback: string): string {
@@ -187,13 +224,18 @@ async function listRoutines(agentGroupId: string): Promise<Routine[]> {
     for (const row of rows ?? []) {
       if (!row.recurrence) continue;
       const seriesId = row.seriesId ?? row.id;
+      const content = parseTaskContent(row.content);
+      const parts = splitRoutinePrompt(content.prompt, seriesId);
       routines.push({
         seriesId,
         sessionId: session.id,
-        name: routineName(parseTaskContent(row.content).prompt, seriesId),
+        name: routineName(content.prompt, seriesId),
         enabled: row.status === 'pending',
         recurrence: row.recurrence,
         nextRun: row.processAfter,
+        prompt: parts.body,
+        preamble: parts.preamble,
+        hasScript: content.script !== null,
       });
     }
   }
@@ -218,6 +260,84 @@ async function setRoutineEnabled(agentGroupId: string, seriesId: string, enabled
     return mailbox.resumeTask(seriesId);
   });
   return (changed ?? 0) > 0;
+}
+
+type SaveRoutine = { seriesId?: string; name: unknown; prompt: unknown; recurrence: unknown };
+type SaveResult = { ok: true } | { ok: false; status: number; message: string };
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Edit a routine's name, instructions or schedule, or create a new one. The
+ * delivery preamble is kept on edit, and a new routine borrows it from the
+ * group's other routines so it reports to the same place they do.
+ */
+async function saveRoutine(agentGroupId: string, input: SaveRoutine): Promise<SaveResult> {
+  const name = checkRoutineName(input.name);
+  if (!name.ok) return { ok: false, status: 400, message: name.message };
+  const body = typeof input.prompt === 'string' ? input.prompt.trim() : '';
+  if (!body) return { ok: false, status: 400, message: 'Say what the routine should do.' };
+  if (body.length > MAX_ROUTINE_BODY_CHARS) {
+    return { ok: false, status: 413, message: `Instructions are limited to ${MAX_ROUTINE_BODY_CHARS} characters.` };
+  }
+  const recurrence = typeof input.recurrence === 'string' ? input.recurrence.trim().replace(/\s+/g, ' ') : '';
+  if (!recurrence || recurrence.length > 100) return { ok: false, status: 400, message: 'Choose a schedule.' };
+  const tz = await resolveGroupTimezone(agentGroupId);
+  try {
+    validateRecurrence(recurrence, tz);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- any parse failure is the user's typo, reported as a 400
+  } catch {
+    return { ok: false, status: 400, message: 'That schedule is not a valid cron expression.' };
+  }
+
+  const routines = await listRoutines(agentGroupId);
+  if (input.seriesId === undefined) {
+    const preamble = routines.find((r) => r.preamble)?.preamble ?? DEFAULT_ROUTINE_PREAMBLE;
+    let prepared;
+    try {
+      prepared = prepareScheduledTask({
+        name: name.name,
+        prompt: composeRoutinePrompt({ name: name.name, preamble, body }),
+        recurrence,
+        timezone: tz,
+      });
+      // eslint-disable-next-line no-catch-all/no-catch-all -- validation errors go back to the form as a 400
+    } catch (err) {
+      return { ok: false, status: 400, message: errorText(err).split('\n')[0]! };
+    }
+    await createScheduledTask(agentGroupId, prepared);
+    return { ok: true };
+  }
+
+  const routine = routines.find((r) => r.seriesId === input.seriesId);
+  if (!routine) return { ok: false, status: 404, message: 'Routine not found.' };
+  const update: { prompt: string; recurrence?: string; processAfter?: string } = {
+    prompt: composeRoutinePrompt({ name: name.name, preamble: routine.preamble, body }),
+  };
+  if (recurrence !== routine.recurrence) {
+    try {
+      enforceRecurrenceLimit(recurrence, false, routine.hasScript, tz);
+      // eslint-disable-next-line no-catch-all/no-catch-all -- validation errors go back to the form as a 400
+    } catch (err) {
+      return { ok: false, status: 400, message: errorText(err).split('\n')[0]! };
+    }
+    update.recurrence = recurrence;
+    update.processAfter = CronExpressionParser.parse(recurrence, { tz }).next().toDate().toISOString();
+  }
+  const touched = await withExistingMailboxSession(agentGroupId, routine.sessionId, (mailbox) =>
+    mailbox.updateTask(routine.seriesId, update),
+  );
+  if (!touched) return { ok: false, status: 409, message: 'This routine is running right now. Try again in a minute.' };
+  return { ok: true };
+}
+
+async function publicRoutines(agentGroupId: string) {
+  const routines = (await listRoutines(agentGroupId)).map(
+    ({ sessionId: _session, preamble: _preamble, ...rest }) => rest,
+  );
+  return { timezone: await resolveGroupTimezone(agentGroupId), routines };
 }
 
 function agentGroupOf(platformId: string): string | null {
@@ -303,7 +423,7 @@ function requestOriginAllowed(req: IncomingMessage, authority: string): boolean 
   return fetchSite === undefined || fetchSite === 'same-origin' || fetchSite === 'none';
 }
 
-async function parseObject(req: IncomingMessage): Promise<ParsedObject> {
+async function parseObject(req: IncomingMessage, limit = MAX_BODY_BYTES): Promise<ParsedObject> {
   if (!req.headers['content-type']?.toLowerCase().startsWith('application/json')) {
     return { ok: false, status: 415, message: 'Expected application/json.' };
   }
@@ -313,7 +433,7 @@ async function parseObject(req: IncomingMessage): Promise<ParsedObject> {
   for await (const chunk of req) {
     const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     bytes += data.length;
-    if (bytes > MAX_BODY_BYTES) return { ok: false, status: 413, message: 'Message is too large.' };
+    if (bytes > limit) return { ok: false, status: 413, message: 'Message is too large.' };
     chunks.push(data);
   }
 
@@ -331,22 +451,26 @@ async function parseObject(req: IncomingMessage): Promise<ParsedObject> {
 }
 
 async function parseMessage(req: IncomingMessage): Promise<ParsedMessage> {
-  const parsed = await parseObject(req);
+  const parsed = await parseObject(req, MAX_MESSAGE_BODY_BYTES);
   if (!parsed.ok) return parsed;
-  const unexpected = Object.keys(parsed.value).find((field) => field !== 'conversationId' && field !== 'text');
+  const unexpected = Object.keys(parsed.value).find(
+    (field) => field !== 'conversationId' && field !== 'text' && field !== 'attachments',
+  );
   if (unexpected) return { ok: false, status: 400, message: `Unknown field: ${unexpected}.` };
   const conversationId = parsed.value.conversationId;
   if (typeof conversationId !== 'string' || conversationId.length === 0 || conversationId.length > 128) {
     return { ok: false, status: 400, message: 'A valid conversation ID is required.' };
   }
-  const text = parsed.value.text;
-  if (typeof text !== 'string' || text.trim().length === 0) {
+  const uploads = parseUploads(parsed.value.attachments);
+  if (!uploads.ok) return { ok: false, status: 400, message: uploads.message };
+  const text = parsed.value.text ?? '';
+  if (typeof text !== 'string' || (text.trim().length === 0 && uploads.files.length === 0)) {
     return { ok: false, status: 400, message: 'Message text is required.' };
   }
   if (text.length > MAX_MESSAGE_CHARS) {
     return { ok: false, status: 413, message: `Messages are limited to ${MAX_MESSAGE_CHARS} characters.` };
   }
-  return { ok: true, conversationId, text: text.trim() };
+  return { ok: true, conversationId, text: text.trim(), files: uploads.files };
 }
 
 async function parseAction(req: IncomingMessage): Promise<ParsedAction> {
@@ -411,7 +535,7 @@ function responseHeaders(contentType: string): Record<string, string> {
     'x-content-type-options': 'nosniff',
     'x-frame-options': 'DENY',
     'content-security-policy':
-      "default-src 'none'; style-src 'self'; font-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+      "default-src 'none'; style-src 'self'; font-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data: blob:; manifest-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
   };
 }
 
@@ -458,7 +582,7 @@ async function toWebEvent(message: OutboundMessage): Promise<WebEvent | null> {
       }
     }
   }
-  const text = extractText(message);
+  const text = extractText(message) ?? (message.files?.length ? '' : null);
   return text === null ? null : { type: 'reply', text, html: markdown.render(text) };
 }
 
@@ -624,8 +748,55 @@ function createAdapter(): ChannelAdapter {
         sendJson(res, 404, { error: 'Routine not found.' });
         return;
       }
-      const routines = (await listRoutines(agentGroupId)).map(({ sessionId: _session, ...rest }) => rest);
-      sendJson(res, 200, { timezone: await resolveGroupTimezone(agentGroupId), routines });
+      sendJson(res, 200, await publicRoutines(agentGroupId));
+      return;
+    }
+    if (req.method === 'POST' && pathname === '/api/routines/save') {
+      if (!requestOriginAllowed(req, authority) || !originMatches(req.headers.origin, authority)) {
+        sendJson(res, 403, { error: 'Cross-origin requests are not allowed.' });
+        return;
+      }
+      const parsed = await parseObject(req, MAX_BODY_BYTES * 2);
+      if (!parsed.ok) {
+        sendJson(res, parsed.status, { error: parsed.message });
+        return;
+      }
+      const { conversationId, seriesId, name, prompt, recurrence } = parsed.value;
+      if (typeof conversationId !== 'string' || conversationId.length > 128) {
+        sendJson(res, 400, { error: 'A valid conversation ID is required.' });
+        return;
+      }
+      if (seriesId !== undefined && (typeof seriesId !== 'string' || seriesId.length > 128)) {
+        sendJson(res, 400, { error: 'Invalid routine.' });
+        return;
+      }
+      const platformId = await localWebPlatformIdForConversation(conversationId);
+      const agentGroupId = platformId ? agentGroupOf(platformId) : null;
+      if (!agentGroupId) {
+        sendJson(res, 404, { error: 'Conversation not found.' });
+        return;
+      }
+      const result = await saveRoutine(agentGroupId, { seriesId, name, prompt, recurrence });
+      if (!result.ok) {
+        sendJson(res, result.status, { error: result.message });
+        return;
+      }
+      sendJson(res, 200, await publicRoutines(agentGroupId));
+      return;
+    }
+    const fileMatch = req.method === 'GET' ? FILE_ROUTE.exec(pathname) : null;
+    if (fileMatch) {
+      if (!requestOriginAllowed(req, authority)) {
+        sendJson(res, 403, { error: 'Cross-origin requests are not allowed.' });
+        return;
+      }
+      const stored = readStoredFile(fileMatch[1]!);
+      if (!stored) {
+        sendJson(res, 404, { error: 'File not found.' });
+        return;
+      }
+      res.writeHead(200, fileResponseHeaders(stored.file));
+      res.end(stored.body);
       return;
     }
     if (req.method === 'GET' && pathname === '/api/archives') {
@@ -721,17 +892,31 @@ function createAdapter(): ChannelAdapter {
       }
       const id = `local-web-${randomUUID()}`;
       const ts = new Date().toISOString();
+      // The browser's copy; the agent gets its own in the session inbox.
+      const files = parsed.files.map((file) => saveFile(file));
+      const attachments = parsed.files.map((file, i) => ({
+        type: files[i]!.image ? 'image' : 'file',
+        name: files[i]!.name,
+        mimeType: files[i]!.mimeType,
+        size: files[i]!.size,
+        data: file.data.toString('base64'),
+      }));
       await setup.onInbound(platformId, null, {
         id,
         kind: 'chat',
         timestamp: ts,
-        content: { text: parsed.text, sender: 'browser', senderId: LOCAL_WEB_USER_ID },
+        content: {
+          text: parsed.text,
+          sender: 'browser',
+          senderId: LOCAL_WEB_USER_ID,
+          ...(attachments.length > 0 && { attachments }),
+        },
         isGroup: false,
       });
-      appendHistory(platformId, { kind: 'user', id, ts, text: parsed.text });
+      appendHistory(platformId, { kind: 'user', id, ts, text: parsed.text, ...(files.length > 0 && { files }) });
       awaitingReplies.add(platformId);
       lastUserMessageAt.set(platformId, Date.now());
-      sendJson(res, 202, { ok: true, id, ts });
+      sendJson(res, 202, { ok: true, id, ts, files });
       return;
     }
     if (req.method === 'POST' && pathname === '/api/agents') {
@@ -866,12 +1051,23 @@ function createAdapter(): ChannelAdapter {
         event.id = `reply-${randomUUID()}`;
         event.ts = ts;
         if (scheduled) event.scheduled = true;
+        const files = (message.files ?? []).flatMap((file) => {
+          try {
+            return [saveFile({ name: file.filename, mimeType: '', data: file.data })];
+            // eslint-disable-next-line no-catch-all/no-catch-all -- a file that cannot be kept must not drop the reply text
+          } catch (err) {
+            log.warn('Local web could not keep an outbound file', { err });
+            return [];
+          }
+        });
+        if (files.length > 0) event.files = files;
         appendHistory(platformId, {
           kind: 'agent',
           id: event.id,
           ts,
           text: event.text,
           ...(scheduled && { scheduled: true }),
+          ...(files.length > 0 && { files }),
         });
       } else if (event.type === 'question') {
         event.ts = ts;
