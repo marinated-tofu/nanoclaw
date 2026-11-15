@@ -99,6 +99,11 @@ body {
 body {
   display: flex;
   flex-direction: column;
+  /* App shell: pinned to the visible viewport so iOS rubber-banding and the
+     keyboard cannot shift or shrink it. --app-height is set from visualViewport. */
+  position: fixed;
+  inset: 0;
+  width: 100%;
   height: 100dvh;
   height: var(--app-height, 100dvh);
   background: var(--color-surface);
