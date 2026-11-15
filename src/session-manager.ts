@@ -385,12 +385,12 @@ function extractAttachmentFiles(
       if (typeof att.data !== 'string') continue;
 
       const rawName = deriveAttachmentName(att);
-      const filename = isSafeAttachmentName(rawName) ? rawName : `attachment-${Date.now()}`;
-      if (filename !== rawName) {
+      const safeName = isSafeAttachmentName(rawName) ? rawName : `attachment-${Date.now()}`;
+      if (safeName !== rawName) {
         log.warn('Refused unsafe attachment filename, would escape inbox', {
           messageId,
           rawName,
-          replacement: filename,
+          replacement: safeName,
         });
       }
 
@@ -405,18 +405,26 @@ function extractAttachmentFiles(
       // Unsafe inbox — no attachment can be written safely.
       if (!inbox) break;
 
-      try {
-        inbox.writeNewFile(filename, Buffer.from(att.data as string, 'base64'));
-      } catch (err: unknown) {
-        const e = err as NodeJS.ErrnoException;
-        if (e.code === 'EEXIST') {
-          log.warn('Inbox attachment target already exists, refusing to overwrite', {
-            messageId,
-            filename,
-          });
-          continue;
+      // Several attachments in one message can share a name (a phone names every
+      // pasted screenshot image.png). Never overwrite and never drop one: on a
+      // collision, number it (image-2.png, image-3.png, ...).
+      const dot = safeName.lastIndexOf('.');
+      const stem = dot > 0 ? safeName.slice(0, dot) : safeName;
+      const ext = dot > 0 ? safeName.slice(dot) : '';
+      let filename = safeName;
+      let saved = false;
+      for (let n = 2; n < 1000 && !saved; n++) {
+        try {
+          inbox.writeNewFile(filename, Buffer.from(att.data as string, 'base64'));
+          saved = true;
+        } catch (err: unknown) {
+          if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+          filename = `${stem}-${n}${ext}`;
         }
-        throw err;
+      }
+      if (!saved) {
+        log.warn('Could not find a free inbox filename for attachment', { messageId, filename: safeName });
+        continue;
       }
 
       att.name = filename;
