@@ -530,6 +530,25 @@
     older.disabled = false;
   });
 
+  // ---- viewport ----
+  // iOS Safari can leave the page shorter than the screen after the keyboard or
+  // the toolbar moves (the composer then floats mid-screen). Size the app from
+  // the visual viewport directly and re-measure whenever it may have changed.
+  function fitViewport() {
+    const vv = window.visualViewport;
+    const height = vv ? vv.height : window.innerHeight;
+    document.documentElement.style.setProperty('--app-height', `${Math.round(height)}px`);
+    if (window.scrollY || (vv && vv.offsetTop)) window.scrollTo(0, 0);
+  }
+  fitViewport();
+  window.visualViewport?.addEventListener('resize', fitViewport);
+  window.visualViewport?.addEventListener('scroll', fitViewport);
+  window.addEventListener('resize', fitViewport);
+  window.addEventListener('orientationchange', fitViewport);
+  window.addEventListener('pageshow', fitViewport);
+  document.addEventListener('visibilitychange', fitViewport);
+  input.addEventListener('blur', () => setTimeout(fitViewport, 100));
+
   // ---- composer ----
   function resize() {
     input.style.height = 'auto';
