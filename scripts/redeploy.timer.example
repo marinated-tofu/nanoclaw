@@ -1,0 +1,24 @@
+# Redeploy on merge: copy both units to ~/.config/systemd/user/, replacing
+# SERVICE with your install's service name (systemctl --user list-units 'nanoclaw*'),
+# then: systemctl --user daemon-reload && systemctl --user enable --now nanoclaw-redeploy.timer
+#
+# ---- nanoclaw-redeploy.service ----
+# [Unit]
+# Description=Deploy origin/main to NanoClaw
+#
+# [Service]
+# Type=oneshot
+# WorkingDirectory=%h/nanoclaw
+# Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# ExecStart=%h/nanoclaw/scripts/redeploy.sh SERVICE
+#
+# ---- nanoclaw-redeploy.timer ----
+# [Unit]
+# Description=Check origin/main for NanoClaw changes every 2 minutes
+#
+# [Timer]
+# OnBootSec=2min
+# OnUnitActiveSec=2min
+#
+# [Install]
+# WantedBy=timers.target
