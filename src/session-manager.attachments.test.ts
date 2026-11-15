@@ -141,6 +141,13 @@ describe('extractAttachmentFiles — inbox dir swapped after the checks', () => 
     expect(fs.readFileSync(path.join(inbox, 'a.txt'), 'utf-8')).toBe('bytes-a.txt');
     expect(fs.readFileSync(path.join(inbox, 'b.txt'), 'utf-8')).toBe('bytes-b.txt');
   });
+
+  it('keeps every attachment when several share a name', async () => {
+    await writeSessionMessage(AG, SESS, attachmentMessage('same-name', ['image.png', 'image.png', 'image.png']));
+
+    const inbox = path.join(sessionDir(AG, SESS), 'inbox', 'same-name');
+    expect(fs.readdirSync(inbox).sort()).toEqual(['image-2.png', 'image-3.png', 'image.png']);
+  });
 });
 
 describe('extractAttachmentFiles — inbox-root symlink containment (#2828 sibling)', () => {
