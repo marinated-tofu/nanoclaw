@@ -35,6 +35,7 @@ import {
   parseCreateLocalWebAgentRequest,
 } from './local-web-conversations.js';
 import { accessConfigFromEnv, createAccessVerifier } from './local-web-access.js';
+import { readRecording, transcribe } from './local-web-stt.js';
 import {
   fileResponseHeaders,
   MAX_UPLOAD_BYTES,
@@ -921,6 +922,24 @@ function createAdapter(): ChannelAdapter {
       awaitingReplies.add(platformId);
       lastUserMessageAt.set(platformId, Date.now());
       sendJson(res, 202, { ok: true, id, ts, files });
+      return;
+    }
+    if (req.method === 'POST' && pathname === '/api/transcribe') {
+      if (!requestOriginAllowed(req, authority) || !originMatches(req.headers.origin, authority)) {
+        sendJson(res, 403, { error: 'Cross-origin requests are not allowed.' });
+        return;
+      }
+      const recording = await readRecording(req);
+      if (!recording.ok) {
+        sendJson(res, recording.status, { error: recording.message });
+        return;
+      }
+      const result = await transcribe(recording, url.searchParams.get('language'));
+      if (!result.ok) {
+        sendJson(res, result.status, { error: result.message });
+        return;
+      }
+      sendJson(res, 200, { text: result.text });
       return;
     }
     if (req.method === 'POST' && pathname === '/api/agents') {
